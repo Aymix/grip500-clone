@@ -49,12 +49,17 @@ jobs:
 
       # One scan, three consumers: the JSON report is converted into a SARIF
       # upload, a job summary table, and the pass/fail gate below.
+      #
+      # --ignorefile /dev/null opts the scan out of auto-discovering
+      # .trivyignore.yaml, so the report stays complete. Suppressions are applied
+      # only at the gate — the summary and Security tab always show everything.
       - name: Scan image with Trivy
         run: |
           trivy image \
             --scanners vuln,secret \
             --format json \
             --output trivy.json \
+            --ignorefile /dev/null \
             --exit-code 0 \
             grip500-clone:${{ github.sha }}
 
@@ -110,6 +115,19 @@ jobs:
 
             echo ""
 
+            # Reflect the gate: of the HIGH/CRITICAL above, how many actually fail
+            # the build vs. are suppressed as unfixable.
+            if [ -f .trivyignore.yaml ]; then
+              ids=$(grep -oE 'CVE-[0-9]{4}-[0-9]+' .trivyignore.yaml | sort -u | jq -R . | jq -sc .)
+              suppressed=$(jq --argjson ids "$ids" '
+                [ .Results[]?.Vulnerabilities[]?
+                  | select((.Severity == "CRITICAL" or .Severity == "HIGH") and (.VulnerabilityID | IN($ids[])))
+                ] | length' trivy.json)
+              echo "🔕 **$suppressed** of the $count are suppressed by \`.trivyignore.yaml\` — base-image CVEs with no upstream fix, expiring 2026-10-22. **$((count - suppressed))** gate the build."
+            fi
+
+            echo ""
+
             secrets=$(jq '[.Results[]?.Secrets[]?] | length' trivy.json)
             if [ "$secrets" -gt 0 ]; then
               echo "### 🔑 $secrets exposed secret(s)"
@@ -144,6 +162,13 @@ jobs:
           category: trivy-image
 
       # Runs last so the summary and Security tab are populated even when this fails.
+      # .trivyignore.yaml suppresses base-image CVEs that have no upstream fix;
+      # every entry there carries an expiry date so they get re-reviewed.
       - name: Fail on HIGH/CRITICAL vulnerabilities
         if: always() && hashFiles('trivy.json') != ''
-        run: trivy convert --exit-code 1 --severity HIGH,CRITICAL trivy.json
+        run: |
+          trivy convert \
+            --exit-code 1 \
+            --severity HIGH,CRITICAL \
+            --ignorefile .trivyignore.yaml \
+            trivy.json
