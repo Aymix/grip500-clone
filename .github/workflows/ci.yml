@@ -124,6 +124,14 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Upload Trivy report
+        if: always() && hashFiles('trivy.json') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-report
+          path: trivy.json
+          retention-days: 30
+
       - name: Convert report to SARIF
         if: always() && hashFiles('trivy.json') != ''
         run: trivy convert --format sarif --output trivy.sarif trivy.json
