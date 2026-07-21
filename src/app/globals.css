@@ -1,0 +1,28 @@
+@import "tailwindcss";
+
+/* Saira Semi Condensed — Grip500's display/nav font (real files self-hosted). */
+@font-face { font-family: "Saira Semi Condensed"; src: url("/fonts/saira-regular.woff2") format("woff2"); font-weight: 400; font-display: swap; }
+@font-face { font-family: "Saira Semi Condensed"; src: url("/fonts/saira-semibold.woff2") format("woff2"); font-weight: 600; font-display: swap; }
+@font-face { font-family: "Saira Semi Condensed"; src: url("/fonts/saira-bold.woff2") format("woff2"); font-weight: 700; font-display: swap; }
+
+/* fontello — Grip500's icon font (aliased with FontAwesome-style .fa-* class names).
+   Glyph code points read from the live .fa-*::before rules. */
+@font-face { font-family: "fontello"; src: url("/fonts/fontello.woff2") format("woff2"); font-weight: normal; font-style: normal; font-display: swap; }
+.fa { font-family: "fontello"; font-style: normal; font-weight: normal; line-height: 1; display: inline-block; -webkit-font-smoothing: antialiased; }
+.fa-user-o::before { content: "\f2c0"; }
+.fa-angle-down::before { content: "\f107"; }
+.fa-angle-right::before { content: "\f105"; }
+.fa-basket::before { content: "\e801"; }
+
+@theme inline {
+  --font-sans: var(--font-roboto), system-ui, Arial, sans-serif;
+  --font-saira: "Saira Semi Condensed", system-ui, sans-serif;
+  --color-gr-orange: #fe6215;     /* primary accent — 500, panier, mon compte */
+  --color-gr-dark: #1e1e20;       /* dark menu row */
+  --color-gr-pill: #2a2a2c;       /* panier pill */
+  --color-gr-grey: #a3a3a8;       /* nav + panier text */
+  --color-gr-grey-2: #727278;     /* utility-strip text */
+}
+
+html, body { height: 100%; margin: 0; }
+body { font-family: var(--font-sans); color: #1e1e20; background: #fff; }
