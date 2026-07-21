@@ -3,15 +3,19 @@ name: CI
 on:
   push:
     branches:
-      - master
+      - main
   pull_request:
     branches:
-      - master
+      - main
 
 jobs:
   quality:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
+
+    permissions:
+      contents: read
+      security-events: write
 
     steps:
       - name: Checkout
@@ -34,3 +38,104 @@ jobs:
 
       - name: Build
         run: npm run build
+
+      - name: Build Docker image
+        run: docker build -t grip500-clone:${{ github.sha }} .
+
+      - name: Install Trivy
+        uses: aquasecurity/setup-trivy@v0.3.1
+        with:
+          version: v0.72.0
+
+      # One scan, three consumers: the JSON report is converted into a SARIF
+      # upload, a job summary table, and the pass/fail gate below.
+      - name: Scan image with Trivy
+        run: |
+          trivy image \
+            --scanners vuln,secret \
+            --format json \
+            --output trivy.json \
+            --exit-code 0 \
+            grip500-clone:${{ github.sha }}
+
+      - name: Publish Trivy results to job summary
+        if: always()
+        run: |
+          if [ ! -f trivy.json ]; then
+            echo "## 🛡️ Trivy scan" >> "$GITHUB_STEP_SUMMARY"
+            echo "Scan did not produce a report — check the scan step logs." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          {
+            echo "## 🛡️ Trivy scan — \`grip500-clone:${GITHUB_SHA:0:7}\`"
+            echo ""
+
+            jq -r '
+              [.Results[]?.Vulnerabilities[]?] as $v
+              | "| Severity | Count |",
+                "| --- | ---: |",
+                "| 🔴 CRITICAL | \([$v[] | select(.Severity == "CRITICAL")] | length) |",
+                "| 🟠 HIGH | \([$v[] | select(.Severity == "HIGH")] | length) |",
+                "| 🟡 MEDIUM | \([$v[] | select(.Severity == "MEDIUM")] | length) |",
+                "| ⚪ LOW | \([$v[] | select(.Severity == "LOW")] | length) |",
+                "| **Total** | **\($v | length)** |"
+            ' trivy.json
+
+            echo ""
+
+            # Detail table, HIGH/CRITICAL only — the ones that gate the build.
+            count=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "CRITICAL" or .Severity == "HIGH")] | length' trivy.json)
+            if [ "$count" -gt 0 ]; then
+              echo "<details open><summary><b>$count HIGH/CRITICAL findings</b></summary>"
+              echo ""
+              jq -r '
+                "| Severity | Package | Installed | Fixed in | Vulnerability |",
+                "| --- | --- | --- | --- | --- |",
+                ( [.Results[]?.Vulnerabilities[]? | select(.Severity == "CRITICAL" or .Severity == "HIGH")]
+                  | sort_by(.Severity)
+                  | .[:50][]
+                  | "| \(.Severity) | \(.PkgName) | \(.InstalledVersion) | \(.FixedVersion // "—") | [\(.VulnerabilityID)](\(.PrimaryURL // "https://nvd.nist.gov/vuln/detail/\(.VulnerabilityID)")) |"
+                )
+              ' trivy.json
+              if [ "$count" -gt 50 ]; then
+                echo ""
+                echo "_Showing the first 50 of $count. Full list in the Security tab._"
+              fi
+              echo ""
+              echo "</details>"
+            else
+              echo "✅ No HIGH or CRITICAL vulnerabilities found."
+            fi
+
+            echo ""
+
+            secrets=$(jq '[.Results[]?.Secrets[]?] | length' trivy.json)
+            if [ "$secrets" -gt 0 ]; then
+              echo "### 🔑 $secrets exposed secret(s)"
+              echo ""
+              jq -r '
+                "| Severity | Rule | File | Line |",
+                "| --- | --- | --- | --- |",
+                ( .Results[]? as $r | $r.Secrets[]?
+                  | "| \(.Severity) | \(.Title) | `\($r.Target)` | \(.StartLine) |"
+                )
+              ' trivy.json
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Convert report to SARIF
+        if: always() && hashFiles('trivy.json') != ''
+        run: trivy convert --format sarif --output trivy.sarif trivy.json
+
+      - name: Upload SARIF to code scanning
+        if: always() && hashFiles('trivy.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy.sarif
+          category: trivy-image
+
+      # Runs last so the summary and Security tab are populated even when this fails.
+      - name: Fail on HIGH/CRITICAL vulnerabilities
+        if: always() && hashFiles('trivy.json') != ''
+        run: trivy convert --exit-code 1 --severity HIGH,CRITICAL trivy.json
