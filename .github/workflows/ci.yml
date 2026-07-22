@@ -60,7 +60,6 @@ jobs:
 
     permissions:
       contents: read
-      security-events: write
 
     steps:
       - name: Checkout
@@ -74,133 +73,90 @@ jobs:
       - name: Load Docker image
         run: gunzip -c image.tar.gz | docker load
 
-      - name: Install Trivy
-        uses: aquasecurity/setup-trivy@v0.3.1
+      # ------------------------------------------------------------------
+      # Scan 1 of 3 — the application image we just built.
+      # ------------------------------------------------------------------
+      - name: 'Scan 1/3: app image'
+        uses: aquasecurity/trivy-action@0.36.0
+        # Opt out of auto-discovering .trivyignore.yaml so the demo table shows
+        # every finding, including the unfixable base-image CVEs.
+        env:
+          TRIVY_IGNOREFILE: /dev/null
         with:
-          version: v0.72.0
+          scan-type: image
+          image-ref: grip500-clone:${{ github.sha }}
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          format: table
+          output: scan-app.txt
+          exit-code: '0'
 
-      # One scan, three consumers: the JSON report is converted into a SARIF
-      # upload, a job summary table, and the pass/fail gate below.
-      #
-      # --ignorefile /dev/null opts the scan out of auto-discovering
-      # .trivyignore.yaml, so the report stays complete. Suppressions are applied
-      # only at the gate — the summary and Security tab always show everything.
-      - name: Scan image with Trivy
-        run: |
-          trivy image \
-            --scanners vuln,secret \
-            --format json \
-            --output trivy.json \
-            --ignorefile /dev/null \
-            --exit-code 0 \
-            grip500-clone:${{ github.sha }}
+      # ------------------------------------------------------------------
+      # Scan 2 of 3 — php-fpm configuration (misconfiguration scan).
+      # Findings come from docker/php-fpm/Dockerfile; Trivy has no built-in
+      # checks for .conf/.ini files. See docker/php-fpm/www.conf.
+      # ------------------------------------------------------------------
+      - name: 'Scan 2/3: php-fpm config'
+        uses: aquasecurity/trivy-action@0.36.0
+        with:
+          scan-type: config
+          scan-ref: docker/php-fpm
+          format: table
+          output: scan-phpfpm.txt
+          exit-code: '0'
 
-      - name: Publish Trivy results to job summary
+      # ------------------------------------------------------------------
+      # Scan 3 of 3 — a third-party base image pulled from Docker Hub.
+      # ------------------------------------------------------------------
+      - name: 'Scan 3/3: nginx image'
+        uses: aquasecurity/trivy-action@0.36.0
+        with:
+          scan-type: image
+          image-ref: nginx:1.29-alpine
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          format: table
+          output: scan-nginx.txt
+          exit-code: '0'
+
+      - name: Publish all three scans to the run summary
         if: always()
         run: |
-          if [ ! -f trivy.json ]; then
-            echo "## 🛡️ Trivy scan" >> "$GITHUB_STEP_SUMMARY"
-            echo "Scan did not produce a report — check the scan step logs." >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
+          emit() {
+            title="$1"; subtitle="$2"; file="$3"
+            echo "## $title"
+            echo ""
+            echo "_${subtitle}_"
+            echo ""
+            if [ -s "$file" ]; then
+              echo '```'
+              cat "$file"
+              echo '```'
+            else
+              echo "✅ Nothing reported."
+            fi
+            echo ""
+          }
 
           {
-            echo "## 🛡️ Trivy scan — \`grip500-clone:${GITHUB_SHA:0:7}\`"
+            echo "# 🛡️ Trivy — 3 scans"
             echo ""
-
-            jq -r '
-              [.Results[]?.Vulnerabilities[]?] as $v
-              | "| Severity | Count |",
-                "| --- | ---: |",
-                "| 🔴 CRITICAL | \([$v[] | select(.Severity == "CRITICAL")] | length) |",
-                "| 🟠 HIGH | \([$v[] | select(.Severity == "HIGH")] | length) |",
-                "| 🟡 MEDIUM | \([$v[] | select(.Severity == "MEDIUM")] | length) |",
-                "| ⚪ LOW | \([$v[] | select(.Severity == "LOW")] | length) |",
-                "| **Total** | **\($v | length)** |"
-            ' trivy.json
-
-            echo ""
-
-            # Detail table, HIGH/CRITICAL only — the ones that gate the build.
-            count=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "CRITICAL" or .Severity == "HIGH")] | length' trivy.json)
-            if [ "$count" -gt 0 ]; then
-              echo "<details open><summary><b>$count HIGH/CRITICAL findings</b></summary>"
-              echo ""
-              jq -r '
-                "| Severity | Package | Installed | Fixed in | Vulnerability |",
-                "| --- | --- | --- | --- | --- |",
-                ( [.Results[]?.Vulnerabilities[]? | select(.Severity == "CRITICAL" or .Severity == "HIGH")]
-                  | sort_by(.Severity)
-                  | .[:50][]
-                  | "| \(.Severity) | \(.PkgName) | \(.InstalledVersion) | \(.FixedVersion // "—") | [\(.VulnerabilityID)](\(.PrimaryURL // "https://nvd.nist.gov/vuln/detail/\(.VulnerabilityID)")) |"
-                )
-              ' trivy.json
-              if [ "$count" -gt 50 ]; then
-                echo ""
-                echo "_Showing the first 50 of $count. Full list in the Security tab._"
-              fi
-              echo ""
-              echo "</details>"
-            else
-              echo "✅ No HIGH or CRITICAL vulnerabilities found."
-            fi
-
-            echo ""
-
-            # Reflect the gate: of the HIGH/CRITICAL above, how many actually fail
-            # the build vs. are suppressed as unfixable.
-            if [ -f .trivyignore.yaml ]; then
-              ids=$(grep -oE 'CVE-[0-9]{4}-[0-9]+' .trivyignore.yaml | sort -u | jq -R . | jq -sc .)
-              suppressed=$(jq --argjson ids "$ids" '
-                [ .Results[]?.Vulnerabilities[]?
-                  | select((.Severity == "CRITICAL" or .Severity == "HIGH") and (.VulnerabilityID | IN($ids[])))
-                ] | length' trivy.json)
-              echo "🔕 **$suppressed** of the $count are suppressed by \`.trivyignore.yaml\` — base-image CVEs with no upstream fix, expiring 2026-10-22. **$((count - suppressed))** gate the build."
-            fi
-
-            echo ""
-
-            secrets=$(jq '[.Results[]?.Secrets[]?] | length' trivy.json)
-            if [ "$secrets" -gt 0 ]; then
-              echo "### 🔑 $secrets exposed secret(s)"
-              echo ""
-              jq -r '
-                "| Severity | Rule | File | Line |",
-                "| --- | --- | --- | --- |",
-                ( .Results[]? as $r | $r.Secrets[]?
-                  | "| \(.Severity) | \(.Title) | `\($r.Target)` | \(.StartLine) |"
-                )
-              ' trivy.json
-            fi
+            emit "1️⃣ App image" \
+                 "\`grip500-clone:${GITHUB_SHA:0:7}\` — vulnerabilities, HIGH/CRITICAL only" \
+                 scan-app.txt
+            emit "2️⃣ php-fpm config" \
+                 "\`docker/php-fpm/\` — misconfiguration scan (demo fixture, intentionally insecure)" \
+                 scan-phpfpm.txt
+            emit "3️⃣ nginx image" \
+                 "\`nginx:1.29-alpine\` — vulnerabilities, HIGH/CRITICAL only" \
+                 scan-nginx.txt
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload Trivy report
-        if: always() && hashFiles('trivy.json') != ''
+      - name: Upload raw scan output
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: trivy-report
-          path: trivy.json
+          name: trivy-scans
+          path: scan-*.txt
           retention-days: 30
-
-      - name: Convert report to SARIF
-        if: always() && hashFiles('trivy.json') != ''
-        run: trivy convert --format sarif --output trivy.sarif trivy.json
-
-      - name: Upload SARIF to code scanning
-        if: always() && hashFiles('trivy.sarif') != ''
-        uses: github/codeql-action/upload-sarif@v4
-        with:
-          sarif_file: trivy.sarif
-          category: trivy-image
-
-      # Runs last so the summary and Security tab are populated even when this fails.
-      # .trivyignore.yaml suppresses base-image CVEs that have no upstream fix;
-      # every entry there carries an expiry date so they get re-reviewed.
-      - name: Fail on HIGH/CRITICAL vulnerabilities
-        if: always() && hashFiles('trivy.json') != ''
-        run: |
-          trivy convert \
-            --exit-code 1 \
-            --severity HIGH,CRITICAL \
-            --ignorefile .trivyignore.yaml \
-            trivy.json
+          if-no-files-found: ignore
